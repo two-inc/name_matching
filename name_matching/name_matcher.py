@@ -1,17 +1,60 @@
+import modin.pandas as pd
 import numpy as np
-import pandas as pd
-from tqdm import tqdm
-from operator import iconcat
+from tqdm.auto import tqdm
+import psutil
+import logging
+from pathlib import Path
+from datetime import datetime
+import os
+from typing import Union, Tuple
 from functools import reduce
 from unicodedata import normalize
 from re import escape, sub
-from typing import Union, Tuple
 from itertools import compress
 from sklearn.feature_extraction.text import TfidfVectorizer
 from name_matching.distance_metrics import make_distance_metrics
 from cleanco.termdata import terms_by_type, terms_by_country
 from name_matching.sparse_cosine import sparse_cosine_top_n
+from memory_profiler import profile
 
+# Configure logging
+def setup_logging(log_dir: str = "logs") -> None:
+    """Setup logging configuration"""
+    # Create logs directory if it doesn't exist
+    Path(log_dir).mkdir(exist_ok=True)
+    
+    # Create logger
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.INFO)
+    
+    # Create handlers
+    # File handler with rotation
+    log_file = Path(log_dir) / f"name_matcher_{datetime.now():%Y%m%d}.log"
+    file_handler = logging.handlers.RotatingFileHandler(
+        log_file,
+        maxBytes=10*1024*1024,  # 10MB
+        backupCount=5
+    )
+    file_handler.setLevel(logging.INFO)
+    
+    # Console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.WARNING)  # Only warnings and errors to console
+    
+    # Create formatters and add it to handlers
+    file_format = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    console_format = logging.Formatter('%(levelname)s - %(message)s')
+    
+    file_handler.setFormatter(file_format)
+    console_handler.setFormatter(console_format)
+    
+    # Add handlers to the logger
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    
+    return logger
 
 class NameMatcher:
     """
@@ -95,15 +138,21 @@ class NameMatcher:
         Bool indicating whether the scores of all the algorithms should be returned instead
         of a combined score
         default=False
+    memory_threshold : float
+        The threshold percentage of memory usage above which warnings are logged
+        default=0.85
+    log_dir : str
+        The directory where the log files should be stored
+        default="logs"
     """
 
     def __init__(
         self,
-        ngrams: tuple = (2, 3),
-        top_n: int = 50,
-        low_memory: bool = False,
-        number_of_rows: int = 5000,
+        number_of_rows: int = 100,
         number_of_matches: int = 1,
+        top_n: int = 100,
+        ngrams: tuple = (2, 3),
+        low_memory: bool = False,
         lowercase: bool = True,
         punctuations: bool = True,
         remove_ascii: bool = True,
@@ -121,7 +170,14 @@ class NameMatcher:
         ],
         row_numbers: bool = False,
         return_algorithms_score: bool = False,
+        memory_threshold: float = 0.85,
+        log_dir: str = "logs",
+        modin_engine: str = "ray"
     ):
+        """Initialize with Modin engine selection"""
+        # Set Modin engine if not already set
+        if not os.environ.get("MODIN_ENGINE"):
+            os.environ["MODIN_ENGINE"] = modin_engine
 
         self._possible_matches = None
         self._preprocessed = False
@@ -169,6 +225,9 @@ class NameMatcher:
             lowercase=False, analyzer="char", ngram_range=(ngrams)
         )
         self._n_grams_matching = None
+
+        self._memory_threshold = memory_threshold
+        self._logger = setup_logging(log_dir)
 
     def set_distance_metrics(self, metrics: list) -> None:
         """
@@ -225,62 +284,28 @@ class NameMatcher:
     def _select_top_words(
         self, word: str, word_counts: pd.Series, occurrence_count: int
     ) -> str:
-        """Remove the top words from the string word based on an occurrence_count threshold
-
-        Parameters
-        ----------
-        word: str
-            the string from which the words should be removed
-        word_counts: pd.Series
-            the words which should be removed with their counts as result from a value_counts
-        occurrence_count: int
-            the multiplication factor of the minimum occurrences below which to select
-
-        Returns
-        -------
-        str
-           The string word with the words with a too high word_counts removed
-        """
-        compressed_list = list(
-            compress(
-                word,
-                (word_counts[word] < occurrence_count * word_counts[word].min()).values,
-            )
-        )
-
-        return " ".join(compressed_list)
+        """Vectorized version of word selection"""
+        # Convert word list to series for vectorized operations
+        word_series = pd.Series(word)
+        mask = word_counts[word_series] < occurrence_count * word_counts[word_series].min()
+        return " ".join(word_series[mask])
 
     def _preprocess_reduce(
         self, to_be_matched: pd.DataFrame, occurrence_count: int = 3
     ) -> pd.DataFrame:
-        """Preprocesses and copies the data to obtain the data with reduced strings. The 
-        strings have all words removed which appear more than 3x as often as the least 
-        common word in the string and returns an adjusted copy of the input
-
-        Parameters
-        ----------
-        to_be_matched: pd.DataFrame
-            A dataframe from which the most common words should be removed
-        occurrence_count: int
-            The number of occurrence a word can occur more then the least common word in
-            the string for which it will still be included in the process
-            default=3
-
-        Returns
-        -------
-        pd.DataFrame
-            A dataframe that will contain the reduced strings
-        """
-        individual_words = (
-            to_be_matched[self._column_matching].str.split(expand=True).stack()
-        )
+        """Vectorized preprocessing with reduced string operations"""
+        # Split once and reuse
+        split_words = to_be_matched[self._column_matching].str.split()
+        
+        # Vectorized word counting
+        individual_words = split_words.explode()
         word_counts = individual_words.value_counts()
-        to_be_matched_new = to_be_matched.copy()
-        name = to_be_matched[self._column_matching].str.split()
-        to_be_matched_new[self._column_matching] = name.apply(
+        
+        # Create new dataframe without copy
+        to_be_matched_new = pd.DataFrame(index=to_be_matched.index)
+        to_be_matched_new[self._column_matching] = split_words.apply(
             lambda word: self._select_top_words(word, word_counts, occurrence_count)
         )
-
         return to_be_matched_new
 
     def load_and_process_master_data(
@@ -290,24 +315,9 @@ class NameMatcher:
         start_processing: bool = True,
         transform: bool = True,
     ) -> None:
-        """Load the matching data into the NameMatcher and start the preprocessing.
-
-        Parameters
-        ----------
-        column : string
-            The column name of the dataframe which should be used for the matching
-        df_matching_data: pd.DataFrame
-            The dataframe which is used to match the data to.
-        start_processing : bool
-            A boolean indicating whether to start the preprocessing step after 
-            loading the matching data
-            default: True
-        transform : bool
-            A boolean indicating whether or not the data should be transformed after 
-            the vectoriser is initialised
-            default: True
-        """
+        """Ensure Modin compatibility"""
         self._column = column
+        # Avoid copy if possible
         self._df_matching_data = df_matching_data
         self._original_index = df_matching_data.index
         if start_processing:
@@ -336,99 +346,72 @@ class NameMatcher:
     def match_names(
         self, to_be_matched: Union[pd.Series, pd.DataFrame], column_matching: str
     ) -> Union[pd.Series, pd.DataFrame]:
-        """Performs the name matching operation on the to_be_matched data. First it does 
-        the preprocessing of the data to be matched as well as the matching data if this 
-        has not been performed. Subsequently based on ngrams a cosine similarity is 
-        computed between the matching data and the data to be matched, to the top n 
-        matches fuzzy matching algorithms are performed to determine the best match and
-        the quality of the match.
-
-        Parameters
-        ----------
-        to_be_matched: Union[pd.Series, pd.DataFrame]
-            The data which should be matched
-        column_matching: str
-            string indicating the column which will be matched
-
-        Returns
-        -------
-        Union[pd.Series, pd.DataFrame]
-            A series or dataframe depending on the input containing the match index from 
-            the matching_data dataframe. the name in the to_be_matched data, the name to 
-            which the datapoint was matched and a score between 0 (no match) and 100 
-            (perfect match) to indicate the quality of the matches.
-        """
-        if self._column == "":
-            raise ValueError(
-                "Please first load the master data via the method: " 
-                + "load_and_process_master_data"
-            )
-        if self._verbose:
-            tqdm.pandas()
-            tqdm.write("preprocessing...\n")
-        self._column_matching = column_matching
-
-        is_dataframe = True
+        """Process data in chunks while keeping data in Modin DataFrames"""
         if isinstance(to_be_matched, pd.Series):
             is_dataframe = False
-            to_be_matched = to_be_matched.to_frame().T
-        if not self._preprocessed:
-            self._process_matching_data()
-        to_be_matched = self.preprocess(to_be_matched, self._column_matching)
+            to_be_matched = pd.DataFrame({column_matching: to_be_matched})
 
-        if self._verbose:
-            tqdm.write("preprocessing complete \n searching for matches...\n")
+        total_rows = len(to_be_matched)
+        chunk_size = self._get_optimal_chunk_size(total_rows)
+        num_chunks = (total_rows + chunk_size - 1) // chunk_size
 
-        self._possible_matches = self._search_for_possible_matches(to_be_matched)
+        # Create progress bars
+        outer_pbar = tqdm(total=num_chunks, desc="Processing chunks", 
+                         disable=not self._verbose)
+        results = []
 
-        if self._preprocess_split:
-            self._possible_matches = np.hstack(
-                (
-                    self._search_for_possible_matches(
-                        self._preprocess_reduce(to_be_matched)
+        try:
+            for chunk_idx in range(num_chunks):
+                # Monitor memory
+                self._check_memory_usage()
+                
+                # Get chunk using Modin's partition capabilities
+                chunk_start = chunk_idx * chunk_size
+                chunk_end = min((chunk_idx + 1) * chunk_size, total_rows)
+                
+                # Use Modin's query capabilities instead of iloc
+                chunk = to_be_matched.loc[chunk_start:chunk_end-1]
+                
+                # Process chunk
+                chunk = self.preprocess(chunk, self._column_matching)
+                possible_matches = self._search_for_possible_matches(chunk)
+                
+                if self._preprocess_split:
+                    reduced_matches = self._search_for_possible_matches(
+                        self._preprocess_reduce(chunk)
+                    )
+                    # Convert to Modin DataFrame instead of numpy array
+                    possible_matches = pd.concat([
+                        pd.DataFrame(reduced_matches),
+                        pd.DataFrame(possible_matches)
+                    ], axis=1)
+
+                # Process matches using Modin's apply
+                chunk_matches = chunk.apply(
+                    lambda row: self.fuzzy_matches(
+                        possible_matches.loc[row.name],
+                        row
                     ),
-                    self._possible_matches,
+                    axis=1,
+                    result_type='expand'
                 )
-            )
+                
+                results.append(chunk_matches)
+                outer_pbar.update(1)
+                
+                # Log progress
+                self._logger.info(
+                    f"Processed chunk {chunk_idx + 1}/{num_chunks} "
+                    f"({(chunk_idx + 1)/num_chunks*100:.1f}%)"
+                )
 
-        if self._verbose:
-            tqdm.write("possible matches found   \n fuzzy matching...\n")
-            data_matches = to_be_matched.progress_apply(
-                lambda x: self.fuzzy_matches(
-                    self._possible_matches[to_be_matched.index.get_loc(x.name), :], x
-                ),
-                axis=1,
-            )
-        else:
-            data_matches = to_be_matched.apply(
-                lambda x: self.fuzzy_matches(
-                    self._possible_matches[to_be_matched.index.get_loc(x.name), :], x
-                ),
-                axis=1,
-            )
-        if self._return_algorithms_score:
-            return data_matches
+        finally:
+            outer_pbar.close()
 
-        if self._number_of_matches == 1:
-            data_matches = data_matches.rename(
-                columns={
-                    "match_name_0": "match_name",
-                    "score_0": "score",
-                    "match_index_0": "match_index",
-                }
-            )
-        if is_dataframe and self._original_indexes:
-            for col in data_matches.columns[
-                data_matches.columns.str.contains("match_index")
-            ]:
-                data_matches[col] = self._original_index[
-                    data_matches[col].astype(int).fillna(0)
-                ]
-
-        if self._verbose:
-            tqdm.write("done")
-
-        return data_matches
+        # Combine results using Modin's concat
+        data_matches = pd.concat(results, axis=0)
+        
+        return self._finalize_results(data_matches, is_dataframe)
 
     def fuzzy_matches(
         self, possible_matches: np.array, to_be_matched: pd.Series
@@ -674,90 +657,108 @@ class NameMatcher:
         if self._low_memory:
             self._n_grams_matching = self._n_grams_matching.tocoo()
 
-    def _search_for_possible_matches(self, to_be_matched: pd.DataFrame) -> np.array:
-        """Generates ngrams from the data which should be matched, calculate the cosine 
-        simularity between these data and the matching data. Hereafter a top n of the 
-        matches is selected and returned.
-
-        Parameters
-        ----------
-        to_be_matched : pd.Series
-            A series containing a single instance of the data to be matched
-
-        Returns
-        -------
-        np.array
-            An array of top n values which are most closely matched to the to be matched 
-            data based on the ngrams
+    def _search_for_possible_matches(self, to_be_matched: pd.DataFrame) -> pd.DataFrame:
+        """
+        Use improved sparse cosine implementation with automatic method selection
         """
         if self._n_grams_matching is None:
             raise RuntimeError(
-                """First the data needs to be transformed to be able to use the sparse """
-                + """cosine simularity. To transform the data, run transform_data"""
-                + """ or run load_and_process_master_data with transform=True"""
+                "First transform the data using transform_data or "
+                "load_and_process_master_data with transform=True"
             )
 
+        # Transform data
+        match_ngrams = self._vec.transform(
+            to_be_matched[self._column_matching].to_numpy()
+        )
+
+        # Use low_memory setting to influence available memory
+        available_memory_gb = None
         if self._low_memory:
-            results = np.zeros((len(to_be_matched), self._top_n))
-            input_data = to_be_matched[self._column_matching]
-            for idx, row_name in enumerate(tqdm(input_data, disable=not self._verbose)):
-                match_ngrams = self._vec.transform([row_name])
-                results[idx, :] = sparse_cosine_top_n(
-                    matrix_a=self._n_grams_matching,
-                    matrix_b=match_ngrams,
-                    top_n=self._top_n,
-                    low_memory=self._low_memory,
-                    number_of_rows=self._number_of_rows,
-                    verbose=self._verbose,
-                )
-        else:
-            match_ngrams = self._vec.transform(
-                to_be_matched[self._column_matching].tolist()
-            ).tocsc()
-            results = sparse_cosine_top_n(
-                matrix_a=self._n_grams_matching,
-                matrix_b=match_ngrams,
-                top_n=self._top_n,
-                low_memory=self._low_memory,
-                number_of_rows=self._number_of_rows,
-                verbose=self._verbose,
-            )
+            available_memory_gb = psutil.virtual_memory().available / (1024**3) * 0.5  # Use only 50% of available memory
+        
+        indices, scores = sparse_cosine_top_n(
+            matrix_a=self._n_grams_matching,
+            matrix_b=match_ngrams,
+            top_n=self._top_n,
+            method='auto',
+            available_memory_gb=available_memory_gb
+        )
 
-        return results
+        # Convert to DataFrame
+        return pd.DataFrame(
+            indices,
+            index=to_be_matched.index
+        )
+
+    def _finalize_results(self, data_matches: pd.DataFrame, 
+                         is_dataframe: bool) -> Union[pd.Series, pd.DataFrame]:
+        """Finalize and format results"""
+        if self._return_algorithms_score:
+            return data_matches
+
+        if self._number_of_matches == 1:
+            data_matches = data_matches.rename(columns={
+                "match_name_0": "match_name",
+                "score_0": "score",
+                "match_index_0": "match_index",
+            })
+
+        if is_dataframe and self._original_indexes:
+            index_cols = data_matches.columns[
+                data_matches.columns.str.contains("match_index")
+            ]
+            for col in index_cols:
+                data_matches[col] = self._original_index[
+                    data_matches[col].astype(int).fillna(0)
+                ]
+
+        return data_matches
+
+    def _check_memory_usage(self) -> float:
+        """Monitor memory usage and log warnings"""
+        memory_used = psutil.Process().memory_percent()
+        if memory_used > self._memory_threshold:
+            self._logger.warning(
+                f"High memory usage detected: {memory_used:.1f}% "
+                f"(threshold: {self._memory_threshold*100}%)"
+            )
+        return memory_used
+
+    def _get_optimal_chunk_size(self, total_size: int) -> int:
+        """Dynamically determine chunk size based on available memory"""
+        available_memory = psutil.virtual_memory().available
+        memory_per_row = psutil.Process().memory_info().rss / total_size
+        
+        # Target using 20% of available memory per chunk
+        target_chunk_size = int(0.2 * available_memory / memory_per_row)
+        return min(max(1000, target_chunk_size), total_size)
 
     def preprocess(self, df: pd.DataFrame, column_name: str) -> pd.DataFrame:
-        """Preprocess a dataframe before applying a name matching algorithm. The 
-        preprocessing consists of removing special characters, spaces, converting all 
-        characters to lower case and removing the words given in the word lists
-
-        Parameters
-        ----------
-        df : DataFrame
-            The dataframe or series on which the preprocessing needs to be performed
-        column_name : str
-            The name of the column that is used for the preprocessing
-
-        Returns
-        -------
-        pd.DataFrame
-            The preprocessed dataframe or series depending on the input
-        """
-        df.loc[:, column_name] = df[column_name].astype(str)
+        """Vectorized preprocessing"""
+        # Avoid copy by creating new dataframe
+        processed = pd.DataFrame(index=df.index)
+        series = df[column_name].astype(str)
+        
         if self._preprocess_lowercase:
-            df.loc[:, column_name] = df[column_name].str.lower()
+            series = series.str.lower()
+            
         if self._preprocess_punctuations:
-            df.loc[:, column_name] = df[column_name].str.replace(
-                r"[^\w\s]", "", regex=True
-            )
-            df.loc[:, column_name] = df[column_name].str.replace("  ", " ").str.strip()
+            # Combine regex operations
+            series = (series.str.replace(r"[^\w\s]", "", regex=True)
+                           .str.replace(r"\s+", " ")
+                           .str.strip())
+            
         if self._preprocess_ascii:
-            df.loc[:, column_name] = df[column_name].apply(
-                lambda string: normalize("NFKD", str(string))
+            # Vectorized normalization
+            series = series.apply(
+                lambda x: normalize("NFKD", str(x))
                 .encode("ASCII", "ignore")
                 .decode()
             )
-
-        return df
+            
+        processed[column_name] = series
+        return processed
 
     def _preprocess_word_list(self, terms: dict) -> list:
         """Preprocess legal words to remove punctuations and trailing leading space
@@ -800,32 +801,14 @@ class NameMatcher:
         return word_set
 
     def _process_common_words(self, word_set: set, cut_off: float) -> set:
-        """A method to select the most common words from the matching_data.
-
-        Parameters
-        -------
-        word_set: str
-            the current word list which should be extended with additional words
-        cut_off: float
-            the cut_off percentage of the occurrence of the most occurring word for 
-            which words are still included in the no_soring_words set
-
-        Returns
-        -------
-        Set
-            The current word set with the most common words from the matching_data added
-        """
-        word_counts = (
-            self._df_matching_data[self._column]
-            .str.split(expand=True)
-            .stack()
-            .value_counts()
-        )
-        word_set = word_set.union(
-            set(word_counts[word_counts > np.max(word_counts) * cut_off].index)
-        )
-
-        return word_set
+        """Vectorized word counting"""
+        words = (self._df_matching_data[self._column]
+                .str.split()
+                .explode())
+        word_counts = words.value_counts()
+        threshold = word_counts.max() * cut_off
+        common_words = word_counts[word_counts > threshold].index
+        return word_set.union(set(common_words))
 
     def _make_no_scoring_words(
         self, indicator: str, word_set: set, cut_off: float

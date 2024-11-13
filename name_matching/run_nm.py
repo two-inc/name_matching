@@ -1,7 +1,12 @@
-import pandas as pd
+import modin.pandas as pd
 from name_matching.name_matcher import NameMatcher
 from typing import Union, Tuple
 from unicodedata import normalize
+import warnings
+import os
+
+os.environ["MODIN_ENGINE"] = "ray"
+warnings.filterwarnings("ignore", category=UserWarning)
 
 
 def _match_names_check_data(
@@ -34,15 +39,16 @@ def _match_names_check_data(
             raise ValueError("Could not find one of the columns in the dataframe")
         if (group_column != "") & (group_column not in data.columns):
             raise ValueError("Could not find one of the group_columns in the dataframe")
-        data["name_matching_data"] = data[column]
+        return pd.DataFrame({
+            "name_matching_data": data[column],
+            **{col: data[col] for col in data.columns if col != column}
+        })
     else:
         if group_column != "":
             raise ValueError(
                 "Grouping is only possible when a dataframe is used for both inputs"
             )
-        data = pd.DataFrame(data, columns=["name_matching_data"])
-
-    return data
+        return pd.DataFrame(data, columns=["name_matching_data"])
 
 
 def _match_names_preprocess_data(
@@ -80,25 +86,34 @@ def _match_names_preprocess_data(
         names which should be matched
     """
 
+    processed_first = data_first.copy()
+    processed_second = data_second.copy()
+
     if not case_sensitive:
-        data_first[column] = data_first[column].str.lower().str.strip()
-        data_second[column] = data_second[column].str.lower().str.strip()
+        processed_first[column] = (
+            processed_first[column].str.lower().str.strip()
+        )
+        processed_second[column] = (
+            processed_second[column].str.lower().str.strip()
+        )
+
     if not punctuation_sensitive:
-        data_first[column] = data_first[column].str.replace(r"[^\w\s]", "", regex=True)
-        data_second[column] = data_second[column].str.replace(
-            r"[^\w\s]", "", regex=True
+        pattern = r"[^\w\s]"
+        processed_first[column] = (
+            processed_first[column].str.replace(pattern, "", regex=True)
         )
+        processed_second[column] = (
+            processed_second[column].str.replace(pattern, "", regex=True)
+        )
+
     if not special_character_sensitive:
-        data_first[column] = data_first[column].apply(
-            lambda string: normalize("NFKD", string).encode("ASCII", "ignore").decode()
-        )
-        data_second[column] = data_second[column].apply(
-            lambda string: normalize("NFKD", string).encode("ASCII", "ignore").decode()
-        )
+        normalize_func = lambda x: normalize("NFKD", x).encode("ASCII", "ignore").decode()
+        processed_first[column] = processed_first[column].map(normalize_func)
+        processed_second[column] = processed_second[column].map(normalize_func)
 
-    data_second = data_second.rename_axis("index").reset_index(drop=False)
+    processed_second = processed_second.reset_index(drop=False)
 
-    return data_first, data_second
+    return processed_first, processed_second
 
 
 def _match_names_combine_data(
@@ -134,12 +149,11 @@ def _match_names_combine_data(
         right_on=right_cols,
         suffixes=["", "_matched"],
     )
-    matches["score"] = 100
-    matches = matches.dropna(subset=["index"])
-    matches = matches.rename(columns={"index": "match_index"})
-    matches = matches[["match_index", "score"]]
-
-    return matches
+    return (matches
+            .assign(score=100)
+            .dropna(subset=["index"])
+            .rename(columns={"index": "match_index"})
+            [["match_index", "score"]])
 
 
 def _match_names_match_single(
@@ -172,23 +186,18 @@ def _match_names_match_single(
     matches = _match_names_combine_data(
         data_first, data_second, [name_column], [name_column]
     )
-    unmatched = data_first[~data_first.index.isin(matches.index)].copy()
-    if len(unmatched) > 0:
+    unmatched_idx = data_first.index.difference(matches.index)
+    if len(unmatched_idx) > 0:
+        unmatched = data_first.loc[unmatched_idx]
         matcher.load_and_process_master_data(name_column, data_second, transform=True)
-        matches = pd.concat(
-            [
-                matches,
-                (
-                    matcher.match_names(
-                        to_be_matched=unmatched, column_matching=name_column
-                    )
-                ),
-            ]
+        new_matches = matcher.match_names(
+            to_be_matched=unmatched,
+            column_matching=name_column
         )
-        return matches
-    else:
-        print("All data matched with basic string matching")
-        return matches
+        return pd.concat([matches, new_matches])
+    
+    print("All data matched with basic string matching")
+    return matches
 
 
 def _match_names_match_group(
@@ -230,32 +239,40 @@ def _match_names_match_group(
         [name_column, group_column_first],
         [name_column, group_column_second],
     )
-    unmatched = data_first[~data_first.index.isin(matches.index)]
+    unmatched_idx = data_first.index.difference(matches.index)
+    unmatched = data_first.loc[unmatched_idx]
+    
     if len(unmatched) > 0:
         matcher.load_and_process_master_data(name_column, data_second, transform=False)
-        for group in data_first[group_column_first].unique():
-            data_second_group = data_second[
-                data_second[group_column_second] == group
-            ].copy()
-            matcher.load_and_process_master_data(
-                name_column, data_second_group, start_processing=False
-            )
-            matcher.transform_data()
-            matches = pd.concat(
-                [
-                    matches,
-                    matcher.match_names(
-                        to_be_matched=unmatched[
-                            unmatched[group_column_first] == group
-                        ].copy(),
-                        column_matching=name_column,
-                    ),
+        
+        unique_groups = data_first[group_column_first].unique()
+        group_matches = []
+        
+        for group in unique_groups:
+            group_mask = data_second[group_column_second] == group
+            data_second_group = data_second[group_mask]
+            
+            if len(data_second_group) > 0:
+                matcher.load_and_process_master_data(
+                    name_column, data_second_group, start_processing=False
+                )
+                matcher.transform_data()
+                
+                unmatched_group = unmatched[
+                    unmatched[group_column_first] == group
                 ]
-            )
-    else:
-        print("All data matched with basic string matching")
-        return matches
-
+                
+                if len(unmatched_group) > 0:
+                    group_matches.append(
+                        matcher.match_names(
+                            to_be_matched=unmatched_group,
+                            column_matching=name_column,
+                        )
+                    )
+        
+        if group_matches:
+            matches = pd.concat([matches] + group_matches)
+    
     return matches
 
 
