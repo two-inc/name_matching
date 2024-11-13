@@ -371,9 +371,7 @@ class NameMatcher:
         is_dataframe = True
         if isinstance(to_be_matched, pd.Series):
             is_dataframe = False
-            to_be_matched = pd.DataFrame(
-                [to_be_matched.values], columns=to_be_matched.index.to_list()
-            )
+            to_be_matched = to_be_matched.to_frame().T
         if not self._preprocessed:
             self._process_matching_data()
         to_be_matched = self.preprocess(to_be_matched, self._column_matching)
